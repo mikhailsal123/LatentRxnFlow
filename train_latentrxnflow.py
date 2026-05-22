@@ -541,6 +541,7 @@ def main() -> None:
     args_nn.model.cond_pool = model_cfg.get("cond_pool", "gated")
     args_nn.model.cond_drop_prob = model_cfg.get("cond_drop_prob", 0.2)
     args_nn.model.force_zero_cond = model_cfg.get("force_zero_cond", False)
+    args_nn.model.condition_source = model_cfg.get("condition_source", "fp")
     # CondAttn head specific configs
     args_nn.model.cond_attn_n_heads = model_cfg.get("cond_attn_n_heads", 4)
     args_nn.model.cond_mol_emb_dim = model_cfg.get("cond_mol_emb_dim", 256)

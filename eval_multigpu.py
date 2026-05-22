@@ -216,6 +216,12 @@ def main() -> None:
     args_nn.model.flow_cond_head = model_cfg.get("flow_cond_head", "controlnet")
     args_nn.model.film_hidden_dim = model_cfg.get("film_hidden_dim", model_cfg.get("latent_dim", 256) * 2)
     args_nn.model.film_init_zero = model_cfg.get("film_init_zero", True)
+    args_nn.model.film_s_gamma = model_cfg.get("film_s_gamma", 1.0)
+    args_nn.model.film_s_beta = model_cfg.get("film_s_beta", 0.2)
+    args_nn.model.cond_pool = model_cfg.get("cond_pool", "gated")
+    args_nn.model.cond_drop_prob = model_cfg.get("cond_drop_prob", 0.2)
+    args_nn.model.force_zero_cond = model_cfg.get("force_zero_cond", False)
+    args_nn.model.condition_source = model_cfg.get("condition_source", "fp")
     
     dec = cfg.get("model", {}).get("decoder", {}) or {}
     
@@ -357,4 +363,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

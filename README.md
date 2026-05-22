@@ -74,6 +74,21 @@ or with DDP:
 torchrun --nproc_per_node=4 eval_multigpu.py --config configs/eval.yaml --ddp
 ```
 
+### Legacy epoch 490 reproduction
+
+The NERF epoch 490 checkpoint uses the legacy conditional flow head and
+fingerprint condition path. To reproduce that checkpoint, use the provided
+configs:
+
+```bash
+python eval_multigpu.py --config configs/reproduce_epoch490_test_9017.yaml
+python eval_multigpu.py --config configs/reproduce_epoch490_valid.yaml
+```
+
+The important model settings are `flow_cond_head: film_residual_add`,
+`condition_source: fp`, `cond_pool: None`, `eval.nfe: 20`, and
+`eval.ode_method: heun`.
+
 ## What Is Not Included
 
 The repository intentionally excludes local artifacts:

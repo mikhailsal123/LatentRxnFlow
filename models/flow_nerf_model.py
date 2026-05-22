@@ -265,6 +265,76 @@ class FiLMResidualFlowHead(nn.Module):
         return v
 
 
+class FiLMLegacy(nn.Module):
+    """Legacy FiLM without bounded tanh scaling."""
+    def __init__(self, cond_dim: int, latent_dim: int, hidden_dim: int, init_zero: bool = True):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim * 2),
+        )
+        if init_zero:
+            nn.init.zeros_(self.mlp[-1].weight)
+            nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, h_cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        params = self.mlp(h_cond)
+        gamma, beta = torch.chunk(params, 2, dim=-1)
+        return gamma, beta
+
+
+class FiLMResidualAddFlowHead(nn.Module):
+    """
+    Legacy residual-FiLM flow head used by older eval configs.
+    Unlike FiLMResidualFlowHead, gamma/beta are not tanh-bounded.
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        time_embed_dim: int,
+        cond_dim: int,
+        hidden_dim: int,
+        film_hidden_dim: int = None,
+        film_init_zero: bool = True,
+    ):
+        super().__init__()
+        self.base_mlp = nn.Sequential(
+            nn.Linear(latent_dim + time_embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        if film_hidden_dim is None:
+            film_hidden_dim = hidden_dim
+        self.film = FiLMLegacy(
+            cond_dim=cond_dim,
+            latent_dim=latent_dim,
+            hidden_dim=film_hidden_dim,
+            init_zero=film_init_zero,
+        )
+        self._last_gamma = None
+        self._last_beta = None
+
+    def forward(
+        self,
+        z_t: torch.Tensor,
+        t_emb: torch.Tensor,
+        h_cond: Optional[torch.Tensor] = None,
+        use_condition: bool = True,
+    ) -> torch.Tensor:
+        v_base = self.base_mlp(torch.cat([z_t, t_emb], dim=-1))
+        if h_cond is not None and use_condition:
+            gamma, beta = self.film(h_cond.float())
+            self._last_gamma = gamma.detach()
+            self._last_beta = beta.detach()
+            return v_base * (1 + gamma) + beta
+        self._last_gamma = None
+        self._last_beta = None
+        return v_base
+
+
 class FiLMHiddenFlowHead(nn.Module):
     """
     FiLM-in-Hidden Flow Head: applies FiLM modulation to hidden layer instead of output.
@@ -754,6 +824,15 @@ class FlowNERFModel(nn.Module):
                     film_s_gamma=self.film_s_gamma,
                     film_s_beta=self.film_s_beta,
                 )
+            elif self.flow_cond_head == "film_residual_add":
+                self.flow_head = FiLMResidualAddFlowHead(
+                    latent_dim=latent_dim,
+                    time_embed_dim=time_embed_dim,
+                    cond_dim=cond_dim,
+                    hidden_dim=latent_dim * 2,
+                    film_hidden_dim=self.film_hidden_dim,
+                    film_init_zero=self.film_init_zero,
+                )
             elif self.flow_cond_head == "film_hidden":
                 self.flow_head = FiLMHiddenFlowHead(
                     latent_dim=latent_dim,
@@ -804,7 +883,7 @@ class FlowNERFModel(nn.Module):
             else:
                 raise ValueError(
                     f"Unknown flow_cond_head='{self.flow_cond_head}'. "
-                    f"Expected one of: 'controlnet', 'film_residual', 'film_hidden', 'residual_add', 'concat', 'cond_attn'"
+                    f"Expected one of: 'controlnet', 'film_residual', 'film_residual_add', 'film_hidden', 'residual_add', 'concat', 'cond_attn'"
                 )
         
         # Log configuration
@@ -873,6 +952,11 @@ class FlowNERFModel(nn.Module):
             self.cond_pool = str(args.model.cond_pool).lower()
         else:
             self.cond_pool = "gated"  # Default: gated pooling (A2)
+
+        if hasattr(args, "model") and hasattr(args.model, "condition_source"):
+            self.condition_source = str(args.model.condition_source).lower()
+        else:
+            self.condition_source = "fp"
         
         # Read force_zero_cond from args.model or use default
         if hasattr(args, "model") and hasattr(args.model, "force_zero_cond"):
@@ -1355,6 +1439,14 @@ class FlowNERFModel(nn.Module):
             cond_flat: [B, cond_dim] or None
         """
         cond_flat = None
+
+        if self.condition_source == "embedding" and "condition_embedding" in tensors:
+            cond_emb = tensors["condition_embedding"].to(dtype=torch.float32)
+            if self.cond_project_legacy is not None:
+                cond_flat = self.cond_project_legacy(cond_emb)
+            else:
+                cond_flat = cond_emb
+            return cond_flat
         
         # Priority 1: Use condition_fp + condition_num if available
         if "condition_fp" in tensors and "condition_num" in tensors:
