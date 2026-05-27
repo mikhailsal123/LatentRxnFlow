@@ -9,11 +9,11 @@ files needed to run it.
 
 ## Setup
 
-The reproduction stack is Python 3.7. Create it with conda:
+The reproduction stack is Python 3.9. Create it with conda:
 
 ```bash
 conda env create -f environment.yml
-conda activate latentrxnflow-py37
+conda activate latentrxnflow-py39
 ```
 
 `requirements.txt` is provided for pip-based environments, but conda is

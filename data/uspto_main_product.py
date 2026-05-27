@@ -16,78 +16,55 @@ from random import shuffle
 
 class TransformerDataset(Dataset):
     """
-    原始反应数据集：每个样本是一个 dict，
-    包含 element, src_bond, charge, aroma, mask, reactant_tokens, product_tokens 等。
+    Reaction dataset: each sample is a dict with element, src_bond, charge,
+    aroma, mask, reactant_tokens, product_tokens, etc.
+    Tensor conversion is deferred to __getitem__ so startup is instant and
+    DataLoader workers do the work in parallel.
     """
 
+    _SKIP_SUBSTRS = frozenset((
+        "smile", "action", "idx", "reactant_tokens", "product_tokens",
+        "mol_mapping", "temp_mapping", "time_mapping", "condition_smiles_list",
+    ))
+
     def __init__(self, if_shuffle: bool, data: List[Dict[str, Any]]):
-        self.data = data  # list of dict
+        self.data = data
         self.shuffle = if_shuffle
         self.cat_indices = self._precompute_indices()
 
-        # 把需要 tensor 化的字段转成 tensor
-        condition_fp_count = 0
-        condition_num_count = 0
-        for idx, feature_dict in enumerate(self.data):
-            for key in feature_dict:
-                if (
-                    "smile" in key
-                    or "action" in key
-                    or "idx" in key
-                    or "reactant_tokens" in key
-                    or "product_tokens" in key
-                    or "mol_mapping" in key
-                    or "temp_mapping" in key
-                    or "time_mapping" in key
-                    or "condition_smiles_list" in key
-                    # or "r_type" in key
-                ):
-                    # 这些暂时保持原始 python 对象（list / str），后面再用
-                    continue
-                if isinstance(feature_dict[key], str):
-                    continue
-                # Handle condition_fp: convert to torch.uint8 tensor
-                if key == "condition_fp":
-                    val = feature_dict[key]
-                    # Handle empty arrays
-                    if isinstance(val, np.ndarray):
-                        if val.size == 0:
-                            feature_dict[key] = torch.zeros((0, 512), dtype=torch.uint8)
-                        else:
-                            feature_dict[key] = torch.from_numpy(val).to(torch.uint8)
-                    elif isinstance(val, (list, tuple)):
-                        if len(val) == 0:
-                            feature_dict[key] = torch.zeros((0, 512), dtype=torch.uint8)
-                        else:
-                            feature_dict[key] = torch.tensor(val, dtype=torch.uint8)
-                    else:
-                        feature_dict[key] = torch.tensor(val, dtype=torch.uint8)
-                    condition_fp_count += 1
-                    continue
-                # Handle condition_num: convert to torch.long scalar tensor
-                if key == "condition_num":
-                    val = feature_dict[key]
-                    if isinstance(val, (int, float, np.integer)):
-                        feature_dict[key] = torch.tensor(int(val), dtype=torch.long)
-                    elif torch.is_tensor(val):
-                        feature_dict[key] = val.to(torch.long)
-                    else:
-                        feature_dict[key] = torch.tensor(int(val), dtype=torch.long)
-                    condition_num_count += 1
-                    continue
-                tmp = torch.tensor(feature_dict[key])
-                if "aroma" in key or "mask" in key:
-                    feature_dict[key] = tmp.bool()
-                elif "laplacian" in key:
-                    feature_dict[key] = tmp.float()
+    @staticmethod
+    def _convert_sample(d: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert one sample's numpy/list values to tensors (called lazily)."""
+        for key in d:
+            if any(s in key for s in TransformerDataset._SKIP_SUBSTRS):
+                continue
+            val = d[key]
+            if isinstance(val, str) or torch.is_tensor(val):
+                continue
+            if key == "condition_fp":
+                if isinstance(val, np.ndarray):
+                    d[key] = torch.from_numpy(val).to(torch.uint8) if val.size else torch.zeros((0, 512), dtype=torch.uint8)
+                elif isinstance(val, (list, tuple)) and len(val) == 0:
+                    d[key] = torch.zeros((0, 512), dtype=torch.uint8)
                 else:
-                    feature_dict[key] = tmp.long()
+                    d[key] = torch.tensor(val, dtype=torch.uint8)
+            elif key == "condition_num":
+                d[key] = torch.tensor(int(val), dtype=torch.long) if not torch.is_tensor(val) else val.to(torch.long)
+            else:
+                tmp = torch.from_numpy(val) if isinstance(val, np.ndarray) else torch.tensor(val)
+                if "aroma" in key or "mask" in key:
+                    d[key] = tmp.bool()
+                elif "laplacian" in key:
+                    d[key] = tmp.float()
+                else:
+                    d[key] = tmp.long()
+        return d
 
     def __len__(self) -> int:
         return len(self.data)
 
     def preprocess_data(self, idx: int) -> Dict[str, Any]:
-        data = self.data[idx]
+        data = self._convert_sample(self.data[idx])
 
         if self.shuffle:
             length = data["element"].shape[0]

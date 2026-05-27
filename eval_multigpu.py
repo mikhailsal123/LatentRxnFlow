@@ -70,7 +70,7 @@ def init_distributed():
     local_rank = int(os.environ["LOCAL_RANK"])
 
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", init_method="env://", device_id=local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
     dist.barrier()
     return True, rank, world_size, local_rank
 

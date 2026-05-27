@@ -5,12 +5,12 @@ train:
   seed: 42
   device: cuda
   save_checkpoint: true
-  save_dir: checkpoints
+  save_dir: models
   save_last_ckpt: false
 
   # Optional warm start. `backbone_ckpt` takes precedence over `encoder_ckpt`.
   use_pretrained_encoder: false
-  encoder_ckpt: checkpoints/M_encoder_baseline.pt
+  encoder_ckpt: models/M_encoder_baseline.pt
   backbone_ckpt: null
   freeze_encoder: true
 
@@ -54,16 +54,16 @@ eval:
 
 data:
   # Preferred: give separate train/eval pickle files.
-  train_pickle_path: null
-  eval_pickle_path: null
+  train_pickle_path: data/train_data_rr_only_condition.pickle
+  eval_pickle_path: data/valid_data_rr_only_condition.pickle
 
   # Fallback: split this single pickle by train_ratio/eval_ratio.
-  pickle_path: data/reactions.pkl
+  pickle_path: data/train_data_rr_only_condition.pickle
   split_seed: 42
   train_ratio: 0.9
   eval_ratio: 0.1
   overfit_subset_size: 128
-  num_workers: 4
+  num_workers: 16
 
 experiment:
   project: latentrxnflow

@@ -1788,6 +1788,105 @@ class FlowNERFModel(nn.Module):
             heatmaps.append(zt_logits)
         return torch.stack(heatmaps, dim=1)
 
+    @torch.no_grad()
+    def sample_trajectory_structures(
+        self,
+        tensors: Dict[str, Any],
+        temperature: float = 1.0,
+        n_steps: int = 10,
+    ) -> Dict[str, Any]:
+        """Integrate the ODE and decode full molecular structures at each step.
+
+        Returns a dict with:
+            "latents"    : [n_steps+1, L, B, D]  raw latent trajectory (z0 … z_T)
+            "structures" : list of n_steps+1 dicts, each {"bond","aroma","charge"}
+                           with tensors on CPU, shape [B, L, ...].
+            "src_enc"    : [L, B, D]  encoded reactant (for building controls)
+            "tgt_enc"    : [L, B, D]  encoded product  (for building controls)
+        """
+        src_enc, tgt_enc, src_mask, tgt_mask = self._encode_src_tgt_nodes(tensors)
+        z0 = src_enc                           # [L, B, D]
+        src_mask = tensors["src_mask"]         # [B, L]
+        L, B, D = z0.shape
+        device = z0.device
+
+        cond_flat = self.build_condition_vector(tensors)
+        valid = (~src_mask).bool()             # [B, L]  True = real atom
+        valid_LBD = valid.t().unsqueeze(-1)    # [L, B, 1]
+
+        if cond_flat is not None:
+            cond_expanded_flat = cond_flat.unsqueeze(1).expand(-1, L, -1).reshape(B * L, -1)
+        else:
+            cond_expanded_flat = None
+
+        src_bond = tensors["src_bond"]
+        padding_mask = tensors["src_mask"]
+
+        def _decode_z(z_current: torch.Tensor) -> Dict[str, torch.Tensor]:
+            """Fuse z0 with delta, decode to {bond, aroma, charge}.
+
+            Matches the convention in _build_decoder_embedding (fuse mode):
+                fuser(concat(z0, delta))  where delta = z_current - z0.
+            """
+            delta = z_current - z0
+            z0_flat = z0.reshape(L * B, D)
+            d_flat = delta.reshape(L * B, D)
+            fused = self.delta_fuser(
+                torch.cat([z0_flat, d_flat], dim=-1)
+            ).view(L, B, D)
+            return self.backbone.M_decoder.sample(
+                src_embedding=fused,
+                src_bond=src_bond,
+                padding_mask=padding_mask,
+                temperature=temperature,
+            )
+
+        # -- Collect trajectory: decode z0 as the starting point (t=0) --
+        latents = [z0.clone()]
+        structures = [_decode_z(z0)]
+
+        z = z0.clone()
+        dt = 1.0 / n_steps  # step size in [0, 1] time
+
+        for i in range(n_steps):
+            # Time embedding at the midpoint of this interval
+            t = torch.full((B,), (i + 0.5) * dt, device=device)
+            t_emb = self.time_embed(t)
+            t_flat = t_emb.unsqueeze(1).expand(B, L, -1).reshape(B * L, -1)
+
+            # Heun predictor: velocity at current z
+            z_flat = z.permute(1, 0, 2).reshape(B * L, D)
+            v0_flat, _ = self.flow_v(z_t=z_flat, t_emb=t_flat,
+                                     cond_flat=cond_expanded_flat, B=B, L=L)
+            v0 = v0_flat.view(B, L, D).permute(1, 0, 2) * valid_LBD
+
+            # Euler step to tentative next position
+            z_euler = z + dt * v0
+
+            # Heun corrector: velocity at the predicted position
+            z_euler_flat = z_euler.permute(1, 0, 2).reshape(B * L, D)
+            v1_flat, _ = self.flow_v(z_t=z_euler_flat, t_emb=t_flat,
+                                     cond_flat=cond_expanded_flat, B=B, L=L)
+            v1 = v1_flat.view(B, L, D).permute(1, 0, 2) * valid_LBD
+
+            # Heun update: step using averaged velocity
+            z = z + 0.5 * dt * (v0 + v1)
+
+            latents.append(z.clone())
+            structures.append(_decode_z(z))
+
+        # Move decoded structures to CPU
+        cpu_structures = []
+        for s in structures:
+            cpu_structures.append({k: v.cpu() for k, v in s.items()})
+
+        return {
+            "latents": torch.stack(latents, dim=0),   # [n_steps+1, L, B, D]
+            "structures": cpu_structures,
+            "src_enc": src_enc,
+            "tgt_enc": tgt_enc,
+        }
+
 
     def _flow_forward(
         self,
