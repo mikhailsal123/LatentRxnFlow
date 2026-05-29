@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+import time
 import warnings
 from dataclasses import asdict
 from pathlib import Path
@@ -42,7 +43,6 @@ from utils.aimnet_eval import (
     AIMNetFailure,
     AIMNetResult,
     _suppress_stderr,
-    evaluate_smiles,
     evaluate_smiles_list,
 )
 from utils.data_utils import result2mol
@@ -198,8 +198,6 @@ def compute_trajectory_metrics(
         failure_counts[f.stage] = failure_counts.get(f.stage, 0) + 1
 
     energies = [r.energy if isinstance(r, AIMNetResult) else None for r in aimnet_results]
-
-    # Filter out NaN energies (unsupported elements that slipped through)
     finite_energies = [e for e in energies if e is not None and not math.isnan(e)]
     if len(finite_energies) >= 2:
         diffs = np.diff(finite_energies)
@@ -215,7 +213,6 @@ def compute_trajectory_metrics(
         r.max_force_norm for r in aimnet_results
         if isinstance(r, AIMNetResult) and not math.isnan(r.max_force_norm)
     ]
-
     return {
         "validity_rate": n_success / n_total if n_total > 0 else 0.0,
         "n_success": n_success,
@@ -245,6 +242,7 @@ def main() -> None:
     n_reactions = diag_cfg.get("n_reactions", 100)
     n_steps = diag_cfg.get("n_trajectory_steps", 10)
     aimnet_workers = diag_cfg.get("aimnet_workers", 8)
+    aimnet_batch_size = diag_cfg.get("aimnet_batch_size", 64)
     save_dir = Path(diag_cfg.get("save_path", "experiments/trajectory_diagnostic"))
     save_dir.mkdir(parents=True, exist_ok=True)
     temperature = cfg.get("eval", {}).get("temperature", 0.7)
@@ -298,6 +296,16 @@ def main() -> None:
     # -- Run diagnostic --
     all_results: List[Dict[str, Any]] = []
     global_rxn_idx = 0
+    timing_ode_decode = 0.0
+    timing_smiles = 0.0
+    timing_aimnet = 0.0
+    timing_aimnet_rdkit = 0.0
+    timing_aimnet_compute = 0.0
+    timing_rdkit_parse = 0.0
+    timing_rdkit_addhs = 0.0
+    timing_rdkit_embed = 0.0
+    timing_rdkit_mmff = 0.0
+    timing_rdkit_extract = 0.0
 
     for batch in tqdm(loader, desc="Diagnosing trajectories"):
         tensors_gpu: Dict[str, Any] = {}
@@ -310,16 +318,20 @@ def main() -> None:
         element = tensors_gpu["element"].cpu()    # [B, L]
         src_mask = tensors_gpu["src_mask"].cpu()   # [B, L]
         B = element.shape[0]
+        r_type_batch = tensors_gpu.get("r_type", None)
+        if isinstance(r_type_batch, torch.Tensor):
+            r_type_batch = r_type_batch.detach().cpu()
 
-        # --- Model trajectory ---
+        # --- Model + LERP trajectories ---
+        t0 = time.time()
         with torch.no_grad():
             traj_out = model.sample_trajectory_structures(
                 tensors_gpu, temperature=temperature, n_steps=n_steps,
             )
+        t1 = time.time()
 
         model_smiles = structures_to_smiles(element, src_mask, traj_out["structures"])
 
-        # --- LERP control trajectory ---
         with torch.no_grad():
             lerp_structs = lerp_decode(
                 model,
@@ -331,6 +343,7 @@ def main() -> None:
             )
 
         lerp_smiles = structures_to_smiles(element, src_mask, lerp_structs)
+        t2 = time.time()
 
         # --- Evaluate all samples x steps with AIMNet2 in parallel ---
         n_steps_total = len(model_smiles)  # n_steps + 1
@@ -341,7 +354,27 @@ def main() -> None:
             for step in lerp_smiles:
                 all_smiles.append(step[j])
 
-        all_aimnet = evaluate_smiles_list(all_smiles, n_workers=aimnet_workers)
+        all_aimnet, aimnet_timing = evaluate_smiles_list(
+            all_smiles,
+            n_workers=aimnet_workers,
+            batch_size=aimnet_batch_size,
+            return_timing=True,
+        )
+        t3 = time.time()
+
+        dt_ode = t1 - t0
+        dt_smiles = t2 - t1
+        dt_aimnet = t3 - t2
+        timing_ode_decode += dt_ode
+        timing_smiles += dt_smiles
+        timing_aimnet += dt_aimnet
+        timing_aimnet_rdkit += aimnet_timing["rdkit_prep_s"]
+        timing_aimnet_compute += aimnet_timing["aimnet_compute_s"]
+        timing_rdkit_parse += aimnet_timing["rdkit_parse_s"]
+        timing_rdkit_addhs += aimnet_timing["rdkit_addhs_s"]
+        timing_rdkit_embed += aimnet_timing["rdkit_embed_s"]
+        timing_rdkit_mmff += aimnet_timing["rdkit_mmff_s"]
+        timing_rdkit_extract += aimnet_timing["rdkit_extract_s"]
 
         for j in range(B):
             rxn_idx = global_rxn_idx + j
@@ -375,6 +408,7 @@ def main() -> None:
 
             result = {
                 "rxn_idx": rxn_idx,
+                "molecular_class": int(r_type_batch[j].item()) if isinstance(r_type_batch, torch.Tensor) else -1,
                 "model_smiles": [step[j] for step in model_smiles],
                 "lerp_smiles": [step[j] for step in lerp_smiles],
                 "model_metrics": model_metrics,
@@ -391,6 +425,21 @@ def main() -> None:
             all_results.append(result)
 
         global_rxn_idx += B
+
+    print(
+        f"[timing total] ODE+decode: {timing_ode_decode:.2f}s | "
+        f"SMILES+LERP: {timing_smiles:.2f}s | "
+        f"AIMNet2: {timing_aimnet:.2f}s "
+        f"(RDKit prep: {timing_aimnet_rdkit:.2f}s, "
+        f"AIMNet compute: {timing_aimnet_compute:.2f}s) "
+        f"[RDKit parse/addHs/embed/MMFF/extract: "
+        f"{timing_rdkit_parse:.2f}/"
+        f"{timing_rdkit_addhs:.2f}/"
+        f"{timing_rdkit_embed:.2f}/"
+        f"{timing_rdkit_mmff:.2f}/"
+        f"{timing_rdkit_extract:.2f}s]",
+        flush=True,
+    )
 
     # -- Aggregate summary --
     import math
@@ -471,9 +520,32 @@ def main() -> None:
     wandb.log({"reactions": reaction_table})
 
     # -- Save JSON --
+    # Keep full statistics above, but cap detailed per-reaction logs to avoid
+    # unbounded file growth: at most 100 examples per molecular class.
+    per_class_limit = 100
+    class_counts: Dict[int, int] = {}
+    per_reaction_capped: List[Dict[str, Any]] = []
+    for item in all_results:
+        cls = int(item.get("molecular_class", -1))
+        count = class_counts.get(cls, 0)
+        if count < per_class_limit:
+            per_reaction_capped.append(item)
+            class_counts[cls] = count + 1
+
     results_path = save_dir / "diagnostic_results.json"
     with open(results_path, "w") as f:
-        json.dump({"summary": summary, "per_reaction": all_results}, f, indent=2)
+        json.dump(
+            {
+                "summary": summary,
+                "per_reaction": per_reaction_capped,
+                "per_reaction_cap_per_class": per_class_limit,
+                "per_reaction_kept": len(per_reaction_capped),
+                "per_reaction_total": len(all_results),
+                "per_reaction_counts_by_class": class_counts,
+            },
+            f,
+            indent=2,
+        )
 
     summary_path = save_dir / "summary.json"
     with open(summary_path, "w") as f:

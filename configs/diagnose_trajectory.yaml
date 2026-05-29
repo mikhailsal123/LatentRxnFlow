@@ -28,12 +28,13 @@ model:
     input_mode: fuse
 
 data:
-  num_workers: 32
+  num_workers: 24
 
 diagnose:
-  n_reactions: 1000
+  n_reactions: 10000
   n_trajectory_steps: 10
-  aimnet_workers: 32
+  aimnet_workers: 12
+  aimnet_batch_size: 128
   save_path: experiments/trajectory_diagnostic
 
 experiment:
